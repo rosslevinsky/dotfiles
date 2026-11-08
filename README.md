@@ -55,6 +55,8 @@ bash dotfiles/setup.sh
   in `~/.codex/config.toml`. It isn't a link, because Codex writes its trusted-folder list into it.
   As shipped, `codex/config.toml` sets no key, so the file isn't touched. The merge only sets keys,
   so a key removed from `codex/config.toml` keeps its last value there
+- with `--codex-instructions <file>`, on a machine that has Codex, `~/.codex/AGENTS.md`, generated
+  from the files you name. See *Codex's instructions*
 - the starter files described below
 
 **Make the samples yours before you edit them.** With links, `~/.claude/CLAUDE.md` and
@@ -80,12 +82,44 @@ private layer in a repo of your own*.
 It does not install skills: install them with whatever installs your skills, and see *Things that
 will catch you out* for why. It does not install a workspace file (a `CLAUDE.md` in the folder
 above your repos) either, because such a file names your own projects. A private repo of your own
-can install one. See *What loads, and when*.
+can install one. See *What loads, and when*. Without `--codex-instructions` it never touches
+Codex's instructions, `~/.codex/AGENTS.md`.
 
 **It also needs three things it does not install:** `jq` (without it the status line shows `/`
 for every directory and drops the model and branch), `python3` (the settings merge and the codex
 guard hook), and the tmux plugin manager at `~/.tmux/plugins/tpm`, which `tmux.conf` loads.
 `setup.sh` names whichever is missing, and prints the clone command for the plugin manager.
+
+### Codex's instructions
+
+Claude reads `~/.claude/CLAUDE.md` and every file in `~/.claude/rules/`. Codex reads one user file,
+`AGENTS.md` in its folder (`CODEX_HOME`, or `~/.codex`). To give Codex the same text, name each file
+it should hold, in order:
+
+```bash
+bash dotfiles/setup.sh --codex-instructions ~/src/my-config/claude/CLAUDE.md \
+    --codex-instructions ~/src/my-config/claude/rules/style.md
+```
+
+**It is a generated file, not a link.** A link can show Codex only one file, and you may have
+several. So `setup.sh` writes `AGENTS.md` as a real file: a first line saying it was generated and
+from which files, then each file in the order given, with a blank line between two. The file names
+start with `~/` where they are under your home folder, so the file names no machine's home. It is the same file with
+`--copy`, since it never depended on this checkout.
+
+Because it is a copy of your files, an edit to one of them reaches Codex on the next run, not
+before. A run that would write the same bytes leaves the file alone, its modification time
+included. The file is built beside the old one and then moved into place, so Codex never reads half
+of it, and a file that can't be read stops the run with the old `AGENTS.md` kept.
+
+- **Only a file with that whole first line, as `setup.sh` writes it, is this run's own.** Anything
+  else at `AGENTS.md`, a file of your own or any link, stops the run before it writes anything, and
+  the message names the path.
+  `--replace-links-from` doesn't change that: no run of `setup.sh` makes a link there.
+- **Each file you name must exist and be readable,** or the run stops before any write.
+- **With no Codex folder,** nothing is made, and the report says so in one line.
+- **A later run without the option** leaves the generated file as it is. Delete it yourself if you
+  no longer want it.
 
 ### Links or copies
 
@@ -114,6 +148,8 @@ matches this repo, so it counts as yours until you delete it.
 - **Any other file or link that isn't this repo's** is moved to `<destination>.pre-dotfiles`,
   or `.pre-dotfiles.N` when that name is taken, and the report names it. Nothing is deleted.
 - **`~/.claude/settings.json`** stops the run instead; see *Settings*.
+- **Codex's `AGENTS.md`,** with `--codex-instructions`, stops the run unless `setup.sh` generated
+  it; see *Codex's instructions*.
 - **Identity files** make `--git-identity` refuse before it writes anything.
 - **A checkout you moved or renamed** leaves links pointing at the old path. They look like
   someone else's files, so tell `setup.sh` about the old path:
@@ -140,7 +176,7 @@ or in a private repo of your own (see *How it fits together*).
 |---|---|---|---|
 | base | this repo's files | `setup.sh` | the wrapper runs `setup.sh --no-starters` |
 | settings overlay | your own Claude Code settings | edit `~/.config/dotfiles/settings-overlay.json` | `settings-overlay.json`, passed with `--settings-overlay <file>` |
-| user instructions | your own `~/.claude/CLAUDE.md` | make the sample yours, as in *Install it* | `claude/CLAUDE.md`, passed with `--user-instructions <file>` |
+| user instructions | your own `~/.claude/CLAUDE.md` | make the sample yours, as in *Install it* | `claude/CLAUDE.md`, passed with `--user-instructions <file>`, and the rules in `<your repo>/claude/rules/`, which the wrapper links. Both go to Codex with `--codex-instructions <file>` |
 | identity data | who to route, and the files that do it | edit `~/.config/dotfiles/identity/`, then run `setup.sh --git-identity` | `owners`, `git/` and `ssh/`, passed with `--identity-dir <dir>` |
 | workspace file | instructions for every repo in one folder | write it yourself | a `CLAUDE.md` in your repo's `workspace/` folder, which the wrapper links |
 | machine-local files | tmux settings, and the accounts and folders this machine has | edit the starter files | the same: they differ per machine, so they stay out of the repo |
@@ -218,13 +254,16 @@ repo's `setup.sh` with options that point at your data.
 ~/src/my-config/ssh/github.conf
 ~/src/my-config/settings-overlay.json    your Claude Code settings
 ~/src/my-config/claude/CLAUDE.md         optional: your user instructions, as ~/.claude/CLAUDE.md
+~/src/my-config/claude/rules/*.md        optional: more user instructions, each linked into
+                                         ~/.claude/rules/
 ~/src/my-config/workspace/CLAUDE.md      optional: linked as ~/src/CLAUDE.md
 ```
 
 The names are examples. The wrapper looks for the base in a folder called `dotfiles` beside your
 repo, or wherever `DOTFILES_BASE` says. The folder that holds both checkouts is the workspace
 folder, and a `CLAUDE.md` there is read in every repo under it. It can't be your home folder or a
-folder that holds it, because a `CLAUDE.md` there would load for everything you open.
+folder that holds it, because a `CLAUDE.md` there would load for everything you open. Where Codex
+is, the base generates `~/.codex/AGENTS.md` from `claude/CLAUDE.md` and then the rules.
 
 ### Starting the repo
 
@@ -320,12 +359,35 @@ what you need. Each run:
 1. Checks first, and writes nothing until the checks pass: the base checkout and `python3` are
    there, the workspace folder is not your home folder and doesn't hold it, and any `CLAUDE.md`
    there is the wrapper's own link. A file of yours, or a link to anything else, stops the run.
+   The same goes for `~/.claude/rules/<name>.md` for each rule in `<your repo>/claude/rules/`.
+   `claude/CLAUDE.md`, each rule and `workspace/CLAUDE.md` must be real files in real folders of
+   your repo, not links. The checks also decide what steps 4 and 5 will do, so nothing the base
+   run creates can change it.
 2. Runs `setup.sh --git-identity --identity-dir <your repo>`, if your repo has an `owners` file.
    This goes first, so git routing works even if a later step stops.
 3. Runs `setup.sh --no-starters --settings-overlay <your repo>/settings-overlay.json`, adding
    `--user-instructions <your repo>/claude/CLAUDE.md` when that file exists. Keeping the file in
-   your repo means a pull updates it on every machine.
+   your repo means a pull updates it on every machine. It also adds `--codex-instructions` for
+   `claude/CLAUDE.md`, then for each rule, sorted by name in byte order, so the base generates Codex's
+   `AGENTS.md` from them where Codex's folder exists. The base's own checks for `AGENTS.md` run
+   here, before it writes anything: see *Codex's instructions*.
 4. Links your repo's `workspace` file as `CLAUDE.md` in the workspace folder, if there is one.
+   Without it, the wrapper's own link there is removed and anything else is left alone.
+5. Links each rule as `~/.claude/rules/<name>.md`. The wrapper's own link for a rule you deleted is
+   removed, and any other file there is left alone.
+
+**Codex gets the same instructions as Claude,** in one generated file, since Codex reads only one.
+Claude follows a pull at once, through the links. Codex gets an edit on the next run. The exception
+is a `~/.claude/CLAUDE.md` of your own, which the base keeps (see *If something is already there*):
+Claude then reads that file, and Codex still gets your repo's. Move yours aside and run the wrapper
+again to give both the repo's file. Only your repo's files go into `AGENTS.md`: a rule you keep
+only on one machine, such as `~/.claude/rules/local.md`, reaches Claude but not Codex. With no
+`claude/CLAUDE.md` and no rules, nothing goes to Codex, and an `AGENTS.md` there is left as it is, a
+generated one included.
+
+**The wrapper's own link is one it made.** Its target is exactly the path to your repo's file, as
+the wrapper writes it. A link the wrapper didn't make, a relative one included, is left alone or
+refused, even if it leads to the same file.
 
 Steps 2 and 3 are the whole idea. Without the checks they come down to:
 
@@ -381,7 +443,7 @@ bash ~/src/my-config/setup.sh
 ```
 
 It is safe to run again: a second run changes nothing. With links, a pull already changes most
-files. The run adds new ones and generates `~/.claude/settings.json` again.
+files. The run adds new ones and generates `~/.claude/settings.json` and Codex's `AGENTS.md` again.
 
 ### Moving or renaming a checkout
 
@@ -391,10 +453,15 @@ The links still point at the old path, so tell the wrapper about it:
 bash ~/src/my-config/setup.sh --replace-links-from /old/path/to/dotfiles
 ```
 
-It passes the flag to both runs of this repo's `setup.sh`, and counts a workspace link into that
-path as its own. If you moved both checkouts together, pass the folder that held them. With this
-flag, a `~/.claude/CLAUDE.md` or `~/.tmux.conf` of your own stops the run (see *If something is
-already there*), so move yours aside for that one run and put it back after.
+It passes the flag to both runs of this repo's `setup.sh`. A workspace or rule link counts as the
+wrapper's own when it points at your repo's file under that path, or, if you moved both checkouts
+together, under the folder that held them: pass that folder. The path must be absolute, with no
+`.` or `..` in it, and counts both as you write it and with its linked folders resolved. A refusal
+names the link's target, so you can see which path to pass. With this flag, a `~/.claude/CLAUDE.md` or `~/.tmux.conf` of your own stops the run
+(see *If something is already there*), so move yours aside for that one run and put it back after.
+
+Codex's `AGENTS.md` needs nothing: it is a file, not a link, and the next run writes it again with
+the new paths in its first line.
 
 ---
 
@@ -428,6 +495,14 @@ alongside `AGENTS.md`. The **Project instructions** option in `/config` changes 
 | skills | `~/.claude/skills/<name>/SKILL.md` | every session: `name` and `description` only | whatever installs your skills |
 
 `setup.sh` installs the first. It never touches the others.
+
+Codex reads none of the Claude files above: no `CLAUDE.md` and no `.claude/` folder. It reads a
+repo's own `AGENTS.md`, and one user file, `~/.codex/AGENTS.md`, or `AGENTS.md` in `CODEX_HOME`.
+That file loads in every Codex session on the machine, like the user tier. `setup.sh` generates it
+only when you pass `--codex-instructions`, joining the files you name, since Codex has no rules
+folder to read them from. The wrapper in a private repo of your own passes your user instructions
+and rules (see *Codex's instructions* and *The wrapper*). An edit to one of those files reaches
+Codex on the next run.
 
 Put a workspace file one level above your repos, so it is read inside every one of them and nowhere
 else. In `$HOME` it would load for everything on the machine.
@@ -540,7 +615,7 @@ They run on fictional accounts: `alice`, the organization `acme`, `bob` and `car
 
 | Suite | What it catches |
 |---|---|
-| `tests/test_setup.sh` | a link that dangles, a machine-specific file created or left where it should not be, a run that is not repeatable, a hook that has stopped denying what it exists to deny, settings that grant a blanket permission, `--user-instructions`, the settings merge and drift stop, starter files, moving a checkout, someone's file being lost or replaced, and skills being installed |
+| `tests/test_setup.sh` | a link that dangles, a machine-specific file created or left where it should not be, a run that is not repeatable, a hook that has stopped denying what it exists to deny, settings that grant a blanket permission, `--user-instructions`, the settings merge and drift stop, `--codex-instructions` and the `AGENTS.md` it generates, starter files, moving a checkout, someone's file being lost or replaced, and skills being installed |
 | `tests/test_guard_codex_exec.py` | the codex guard, running the real script in a subprocess. Every assertion is on the decision the hook returns, never its wording: searching a message for "deny" also matches a message explaining why something was allowed |
 | `tests/test_merge_settings.py` | the merge rules, the parsed comparison, and what counts as drift |
 | `tests/test_statusline.sh` | the status line at several terminal widths: the line count, no line overflowing, and the hostname first |
@@ -551,7 +626,7 @@ They run on fictional accounts: `alice`, the organization `acme`, `bob` and `car
 | `tests/test_git_identity_check.sh` | breaks one thing at a time in a clean fixture home and expects `git-identity-check` to name that cause, with live SSH answers played back by a stub |
 | `tests/test_git_identity_audit.sh` | `git-identity-audit` against a fake home for the machine that runs the audit and two fake remote machines reached through a stub ssh: the leak rules, every setup failure, refusing bad config, and that the standalone machine is sent nothing about other accounts and has nothing written |
 | `tests/test_gh_as.sh` | `gh-as` against a stub gh: the token lookup, the refusals, argument passthrough, and that the token never reaches the screen, even under `bash -x` |
-| `tests/test_private_layer.sh` | the sample wrapper in `examples/private-layer/`, run on a fake private repo beside a copy of this checkout: identity links into that repo, the overlay reaching the settings, the user instructions from that repo, no starters, the workspace link, a second run that changes nothing, a workspace file or folder it must refuse, a renamed checkout, a repo with no identity data, and moving from files on one machine |
+| `tests/test_private_layer.sh` | the sample wrapper in `examples/private-layer/`, run on a fake private repo beside a copy of this checkout: identity links into that repo, the overlay reaching the settings, the user instructions from that repo, no starters, the workspace link, the rule links, the files it gives Codex and in what order, what it must leave alone, a second run that changes nothing, a workspace file or folder it must refuse, a renamed checkout, a repo with no identity data, and moving from files on one machine |
 
 ---
 
