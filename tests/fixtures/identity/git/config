@@ -1,0 +1,80 @@
+# Test data: fictional routing for the identity suites. Never installed on a real machine.
+#
+# Same shape as a real data folder: `insteadOf` sends every GitHub URL form for an owner to
+# its SSH alias, and `includeIf hasconfig:remote.*.url` pulls in one whole identity file.
+# There are no `gitdir:` rules, so a repo with no routed remote refuses to commit.
+
+[user]
+	# Never fall back to $USER@$(hostname): refuse to commit instead.
+	useConfigOnly = true
+[init]
+	defaultBranch = main
+
+# Shared by every identity, so no identity file can leave signing switched off. These are
+# defaults, not a lock: a repo-local override still wins, and git-identity-check finds it.
+[gpg]
+	format = ssh
+[gpg "ssh"]
+	allowedSignersFile = ~/.config/git/allowed_signers
+[commit]
+	gpgsign = true
+[tag]
+	gpgsign = true
+
+# --- Transport: every URL form for an owner goes to that owner's SSH alias ---
+[url "git@github-alice:alice/"]
+	insteadOf = git@github.com:alice/
+	insteadOf = https://github.com/alice/
+	insteadOf = ssh://git@github.com/alice/
+[url "git@github-alice:acme/"]
+	insteadOf = git@github.com:acme/
+	insteadOf = https://github.com/acme/
+	insteadOf = ssh://git@github.com/acme/
+[url "git@github-bob:bob/"]
+	insteadOf = git@github.com:bob/
+	insteadOf = https://github.com/bob/
+	insteadOf = ssh://git@github.com/bob/
+[url "git@github-carol:carol/"]
+	insteadOf = git@github.com:carol/
+	insteadOf = https://github.com/carol/
+	insteadOf = ssh://git@github.com/carol/
+
+# --- Identity: one whole identity file per owner ---
+# acme shares alice's alias for transport but has its own identity file.
+[includeIf "hasconfig:remote.*.url:git@github.com:alice/**"]
+	path = ~/.config/git/identity-alice
+[includeIf "hasconfig:remote.*.url:https://github.com/alice/**"]
+	path = ~/.config/git/identity-alice
+[includeIf "hasconfig:remote.*.url:ssh://git@github.com/alice/**"]
+	path = ~/.config/git/identity-alice
+[includeIf "hasconfig:remote.*.url:git@github-alice:alice/**"]
+	path = ~/.config/git/identity-alice
+[includeIf "hasconfig:remote.*.url:git@github.com:acme/**"]
+	path = ~/.config/git/identity-acme
+[includeIf "hasconfig:remote.*.url:https://github.com/acme/**"]
+	path = ~/.config/git/identity-acme
+[includeIf "hasconfig:remote.*.url:ssh://git@github.com/acme/**"]
+	path = ~/.config/git/identity-acme
+[includeIf "hasconfig:remote.*.url:git@github-alice:acme/**"]
+	path = ~/.config/git/identity-acme
+[includeIf "hasconfig:remote.*.url:git@github.com:bob/**"]
+	path = ~/.config/git/identity-bob
+[includeIf "hasconfig:remote.*.url:https://github.com/bob/**"]
+	path = ~/.config/git/identity-bob
+[includeIf "hasconfig:remote.*.url:ssh://git@github.com/bob/**"]
+	path = ~/.config/git/identity-bob
+[includeIf "hasconfig:remote.*.url:git@github-bob:bob/**"]
+	path = ~/.config/git/identity-bob
+[includeIf "hasconfig:remote.*.url:git@github.com:carol/**"]
+	path = ~/.config/git/identity-carol
+[includeIf "hasconfig:remote.*.url:https://github.com/carol/**"]
+	path = ~/.config/git/identity-carol
+[includeIf "hasconfig:remote.*.url:ssh://git@github.com/carol/**"]
+	path = ~/.config/git/identity-carol
+[includeIf "hasconfig:remote.*.url:git@github-carol:carol/**"]
+	path = ~/.config/git/identity-carol
+
+# Machine-local overrides, untracked. Git ignores a missing include. Last, so it can
+# override anything above.
+[include]
+	path = ~/.config/git/local

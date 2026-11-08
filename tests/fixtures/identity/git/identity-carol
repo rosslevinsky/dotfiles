@@ -1,0 +1,5 @@
+# Test data: a declared account that a machine may not have.
+[user]
+	name = carol
+	email = 1003+carol@users.noreply.github.com
+	signingkey = ~/.ssh/id_ed25519_carol

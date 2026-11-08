@@ -1,0 +1,14 @@
+# One identity: who commits to one owner's repos. Keep one file for each identity the owners
+# file names, in this folder.
+#
+# To fill in: remove `#> ` from the suggested lines below, change alice to your account, and
+# rename this file identity-<your account> to match the owners file. Use the private address
+# GitHub shows under Settings, Emails.
+#
+# To check: run `setup.sh --git-identity`, then `~/.local/bin/git-identity-check`. In one of
+# that owner's repos, `git config user.email` shows this address.
+#
+#> [user]
+#>     name = Alice
+#>     email = 1001+alice@users.noreply.github.com
+#>     signingkey = ~/.ssh/id_ed25519_alice

@@ -1,0 +1,10 @@
+.DS_Store
+
+# Claude Code per-cwd scheduled-tasks lockfile (runtime state, never commit).
+.claude/scheduled_tasks.lock
+
+# Skills, if an installer puts any here. This repo tracks no skill files.
+claude/skills/
+
+# Left behind by running the python test suite in tests/.
+__pycache__/

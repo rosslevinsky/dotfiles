@@ -1,0 +1,5 @@
+# Test data: the main account.
+[user]
+	name = Alice
+	email = 1001+alice@users.noreply.github.com
+	signingkey = ~/.ssh/id_ed25519_alice

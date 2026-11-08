@@ -1,0 +1,10 @@
+# The signer list: which key may sign for which address, so git can verify signed commits.
+#
+# To fill in: remove `#> ` from the suggested line below, change alice to your account, and
+# replace <your public key> with the contents of ~/.ssh/id_ed25519_alice.pub. Add one line
+# for each address and key.
+#
+# To check: run `setup.sh --git-identity`, make a commit in a routed repo, then run
+# `git verify-commit HEAD`.
+#
+#> 1001+alice@users.noreply.github.com <your public key>

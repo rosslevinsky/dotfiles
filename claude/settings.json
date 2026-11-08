@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(cat); case \"$f\" in *codex*) printf '%s' \"$f\" | python3 ~/.claude/hooks/guard-codex-exec.py ;; esac",
+            "timeout": 10,
+            "statusMessage": "Checking codex invocation safety"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "bash ~/.claude/statusline-command.sh",
+    "padding": 0
+  }
+}

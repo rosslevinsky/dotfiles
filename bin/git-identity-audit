@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""Audit every machine's GitHub identity setup, and scan history for your addresses.
+
+Run on one machine, the machine that runs the audit. It reads ~/.config/git/audit (machine-local, never committed):
+
+  machine <name> <local|ssh-host> <component|standalone> [<root>:<depth> ...]
+  standalone-accounts <name> <account> [<account> ...]
+  mine <address or glob>          e.g. me@example.com, me+*@example.com, user@*.local
+  since <YYYY-MM-DD>              leaks dated on or after this fail; older ones are reported
+
+How the work is split, and why:
+
+  * Each machine only GATHERS FACTS. For every repo under its roots it reports the
+    GitHub owners its remotes name, its identity include, and every author and committer
+    address in its history with counts and dates. A standalone machine also checks its
+    own setup, which needs only the accounts it is allowed to have.
+  * The machine that runs the audit JUDGES. It alone holds the full account list and the `mine` address
+    patterns, so it decides what is a leak. A standalone machine is never sent other
+    accounts or your addresses, and couldn't recognize them if it were.
+
+The facts are gathered by this same file, sent over ssh on stdin and run with python3,
+so nothing is written on the audited machine. It names no account; its tests enforce
+that, and that the standalone machine receives only its own accounts.
+
+A commit is a leak when its address is yours (a `mine` pattern, or any identity's email)
+and isn't what that repo's identity should use. A GitHub noreply address is public by
+design, so it is only a leak when it ties one account to another account's repo.
+
+Exit status: 0 when nothing failed, 1 when something did, 2 for a usage or config error.
+"""
+
+import datetime
+import fnmatch
+import json
+import os
+import pwd
+import re
+import shlex
+import subprocess
+import sys
+
+HOME = os.environ.get("HOME", "")
+PW_HOME = pwd.getpwuid(os.getuid()).pw_dir
+HISTORY_MARK = "@@history@@ "
+
+
+def run(args, cwd=None, stdin_text=None, timeout=120):
+    try:
+        p = subprocess.run(args, cwd=cwd, input=stdin_text, capture_output=True, text=True, timeout=timeout,
+                           stdin=None if stdin_text is not None else subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, "", str(e)
+    return p.returncode, p.stdout, p.stderr
+
+
+def git(args, cwd="/"):
+    rc, out, _ = run(["git"] + args, cwd=cwd)
+    return rc, out
+
+
+def expand(path):
+    if path == "~":
+        return HOME
+    return os.path.join(HOME, path[2:]) if path.startswith("~/") else path
+
+
+def tilde(path):
+    for prefix in (HOME, PW_HOME):
+        if prefix and path.startswith(prefix + "/"):
+            return "~/" + path[len(prefix) + 1:]
+    return path
+
+
+OWNER_RE = [
+    re.compile(r"^git@github\.com:([^/]+)/"),
+    re.compile(r"^https://(?:[^@/]+@)?github\.com/([^/]+)/"),
+    re.compile(r"^ssh://git@github\.com/([^/]+)/"),
+    re.compile(r"^git@github-[A-Za-z0-9-]+:([^/]+)/"),
+]
+
+
+def owner_of(url):
+    for r in OWNER_RE:
+        m = r.match(url)
+        if m:
+            return m.group(1)
+    return None
+
+
+# --- Fact gathering: runs on the audited machine --------------------------------------
+
+def find_repos(root, depth, out):
+    found = []
+
+    def walk(d, level):
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            out(f"[unreadable] {d}")
+            return
+        dotgit = os.path.join(d, ".git")
+        if os.path.isfile(dotgit) or os.path.lexists(os.path.join(dotgit, "HEAD")) or (
+                os.path.isfile(os.path.join(d, "HEAD")) and os.path.isdir(os.path.join(d, "objects"))
+                and os.path.isdir(os.path.join(d, "refs"))):
+            found.append(d)
+        if level >= depth:
+            return
+        for e in sorted(entries):
+            p = os.path.join(d, e)
+            if e in (".git", "node_modules") or os.path.islink(p) or not os.path.isdir(p):
+                continue
+            walk(p, level + 1)
+
+    walk(root, 0)
+    return found
+
+
+def repos_under(name, roots, out):
+    seen, repos = set(), []
+    for root, depth in roots:
+        if not os.path.isdir(root):
+            out(f"[root-missing] {name} {root}")
+            continue
+        for path in find_repos(root, depth, out):
+            rc, gitdir = git(["rev-parse", "--absolute-git-dir"], cwd=path)
+            if rc != 0:
+                out(f"FAIL [repo-unreadable] {name} {path}: git can't read it")
+                continue
+            if gitdir.strip() in seen:
+                continue
+            seen.add(gitdir.strip())
+            repos.append(path)
+    return repos
+
+
+def remote_owners(path):
+    """GitHub owners named by every remote URL and push URL, includes followed."""
+    rc, out = git(["config", "--includes", "--get-regexp", r"^remote\..*\.(url|pushurl)$"], cwd=path)
+    return sorted({o for o in (owner_of(l.split(None, 1)[1].strip()) for l in out.splitlines() if " " in l) if o})
+
+
+def identity_include(path):
+    """The LAST repo-local include of an identity-* file (git lets the last one win).
+
+    Returns (name, email, signing key) read from that file, or None.
+    """
+    rc, out = git(["config", "--local", "--get-all", "include.path"], cwd=path)
+    rc2, common = git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=path)
+    found = None
+    for p in out.splitlines():     # one value per line; a path may contain spaces
+        full = expand(p)
+        if not os.path.isabs(full):
+            full = os.path.join(common.strip() or path, full)
+        if os.path.basename(full).startswith("identity-") and os.path.isfile(full):
+            _, email = git(["config", "--file", full, "user.email"])
+            _, name = git(["config", "--file", full, "user.name"])
+            _, key = git(["config", "--file", full, "user.signingkey"])
+            found = (name.strip(), email.strip(), key.strip())
+    return found
+
+
+def history_facts(path):
+    rc, log = git(["log", "--all", "--format=%ae%x09%aI%n%ce%x09%cI"], cwd=path)
+    if rc != 0:
+        return None
+    emails = {}
+    for line in log.splitlines():
+        if "\t" not in line:
+            continue
+        email, date = line.split("\t", 1)
+        n, first, last = emails.get(email, (0, date[:10], date[:10]))
+        emails[email] = (n + 1, min(first, date[:10]), max(last, date[:10]))
+    return emails
+
+
+def gather_history(name, roots, out):
+    records = []
+    for path in repos_under(name, roots, out):
+        inc = identity_include(path)
+        emails = history_facts(path)
+        records.append({"path": path, "owners": remote_owners(path),
+                        "include": list(inc) if inc else None,
+                        "emails": emails, "error": emails is None})
+    return records
+
+
+def ident(path, which):
+    rc, out = git(["var", which], cwd=path)
+    return re.sub(r" \d+ [-+]\d{4}$", "", out.strip()) if rc == 0 else None
+
+
+def standalone_check(name, params, out):
+    """The setup check for a machine without the component. Knows only its own accounts."""
+    accounts = params["accounts"]
+    owners = params["owners"]
+    allowed_identities = {(o["name"], o["email"], o["signingkey"]) for o in owners.values()}
+    failed = []
+
+    def fail(tag, msg):
+        failed.append(tag)
+        out(f"FAIL [{tag}] {name}: {msg}")
+
+    # Identity anywhere it would apply to every repo, read from / so no repo's rules match.
+    for scope in ("--global", "--system"):
+        rc, idents = git(["config", scope, "--includes", "--show-origin", "--get-regexp",
+                          r"^(user\.(name|email|signingkey)|author\..*|committer\..*)$"])
+        for line in idents.splitlines():
+            fail("unconditional-identity", f"an identity applies to every repo ({line.strip()})")
+    rc, only = git(["config", "--global", "--includes", "--type=bool", "user.useConfigOnly"])
+    if only.strip() != "true":
+        fail("fallback-identity", "user.useConfigOnly isn't true, so an unrouted repo can invent an identity")
+
+    # Every account alias and owner the routing names must be this machine's own.
+    listing = ""
+    for scope in ("--global", "--system"):
+        rc, part = git(["config", scope, "--includes", "--list"])
+        listing += part
+    for alias in sorted(set(re.findall(r"github-([A-Za-z0-9-]+)", listing, re.I))):
+        if alias not in accounts:
+            fail("standalone-foreign", f"git routing names an account alias outside this machine's list: github-{alias}")
+    for line in listing.splitlines():
+        key, _, value = line.partition("=")
+        k = key.lower()
+        if k.startswith("url.") and k.endswith("insteadof"):
+            for u in (key[4:].rsplit(".", 1)[0], value):
+                o = owner_of(u)
+                if o and o not in owners:
+                    fail("standalone-foreign", f"a rewrite names an owner outside this machine's list: {line}")
+        m = re.match(r"^includeif\.hasconfig:remote\.\*\.url:(.*)\.path$", k)
+        if m:
+            o = owner_of(m.group(1))
+            if o and o not in owners:
+                fail("standalone-foreign", f"an identity rule names an owner outside this machine's list: {key}")
+
+    sshconf = os.path.join(HOME, ".ssh", "config")
+    import glob
+
+    def ssh_lines(path, depth=0):
+        """Every line of an ssh config, following Include as ssh does (relative to ~/.ssh)."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            if depth == 0:
+                fail("ssh-config", "~/.ssh/config can't be read")
+            return
+        for line in lines:
+            yield path, line
+            words = line.replace("=", " ", 1).replace('"', " ").split()
+            if words and words[0].lower() == "include" and depth < 8:
+                for pat in words[1:]:
+                    pat = expand(pat)
+                    if not os.path.isabs(pat):
+                        pat = os.path.join(HOME, ".ssh", pat)
+                    for inc in sorted(glob.glob(pat)):
+                        yield from ssh_lines(inc, depth + 1)
+
+    for src, line in ssh_lines(sshconf):
+        words = line.replace("=", " ", 1).split()
+        if words and words[0].lower() == "host":
+            for w in words[1:]:
+                if w.lower().startswith("github-") and w[7:] not in accounts:
+                    fail("standalone-foreign", f"{tilde(src)} names an alias outside this machine's list: {w}")
+    aliases = {"github.com": accounts[0]}
+    aliases.update({f"github-{a}": a for a in accounts})
+    for alias, acct in aliases.items():
+        rc, g, _ = run(["ssh", "-F", sshconf, "-G", alias])
+        files = [tilde(l.split(None, 1)[1]) for l in g.splitlines() if l.lower().startswith("identityfile ")]
+        if files != [f"~/.ssh/id_ed25519_{acct}"]:
+            fail("ssh-identityfile", f"{alias} would offer {files or 'no key'}, not exactly ~/.ssh/id_ed25519_{acct}")
+        io = [l.split(None, 1)[1] for l in g.splitlines() if l.lower().startswith("identitiesonly ")]
+        if io != ["yes"]:
+            fail("ssh-identitiesonly", f"{alias} has IdentitiesOnly {io[0] if io else 'unset'}")
+    for acct in accounts:
+        for f in (f"id_ed25519_{acct}", f"id_ed25519_{acct}.pub"):
+            if not os.path.exists(os.path.join(HOME, ".ssh", f)):
+                fail("key-missing", f"no ~/.ssh/{f}")
+
+    # Every repo: the identity git will actually use, author AND committer.
+    for path in repos_under(name, params["roots"], out):
+        inc = identity_include(path)
+        rc, local = git(["config", "--local", "--get-regexp",
+                         r"^(user\.(name|email|signingkey)|author\..*|committer\..*)$"], cwd=path)
+        if local.strip() and not inc:
+            fail("repo-local-identity", f"{path} sets {', '.join(l.split()[0] for l in local.splitlines())} itself")
+            continue
+        github_owners = remote_owners(path)
+        routed = [o for o in github_owners if o in owners]
+        if inc:
+            if tuple(inc) not in allowed_identities:
+                fail("repo-include-foreign", f"{path} includes an identity that isn't one of this machine's")
+                continue
+            expected = f"{inc[0]} <{inc[1]}>"
+        elif len(github_owners) > 1:
+            fail("repo-ambiguous", f"{path} has remotes of {', '.join(github_owners)}; add an identity include")
+            continue
+        elif routed:
+            o = owners[routed[0]]
+            expected = f"{o['name']} <{o['email']}>"
+        else:
+            expected = None
+        for which in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
+            got = ident(path, which)
+            if expected is None and got is not None:
+                fail("repo-identity-source", f"{path} has no routed owner yet resolves {which} {got}")
+            elif expected is not None and got != expected:
+                fail("repo-identity-mismatch", f"{path} resolves {which} {got or 'nothing'}, expected {expected}")
+
+    if params.get("live"):
+        for alias, acct in aliases.items():
+            # Options that keep the probe from writing on this machine: no known_hosts
+            # updates or additions, and no connection-sharing socket.
+            rc, so, se = run(["ssh", "-F", sshconf, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                              "-o", "UpdateHostKeys=no", "-o", "StrictHostKeyChecking=yes",
+                              "-o", "ControlMaster=no", "-o", "ControlPath=none", f"git@{alias}"], timeout=30)
+            text = so + se
+            m = re.search(r"Hi ([A-Za-z0-9-]+)!", text)
+            if m and m.group(1) == acct:
+                out(f"ok {name}: {alias} logged in as {acct}")
+            elif m:
+                fail("live-login", f"{alias} logged in as {m.group(1)}, not {acct}")
+            elif "Permission denied (publickey)" in text:
+                fail("live-login", f"{alias} was refused")
+            else:
+                first = text.strip().splitlines()[0] if text.strip() else "no output"
+                fail("live-inconclusive", f"{alias}: neither a login nor a refusal ({first})")
+    if not failed:
+        out(f"{name}: setup ok")
+
+
+def gather(params):
+    """What runs on the audited machine. Prints findings, then one line of history facts."""
+    out = lambda line: print(line, flush=True)
+    roots = [(expand(r), d) for r, d in params["roots"]] if params.get("roots") else default_roots()
+    params["roots"] = roots
+    if params["kind"] == "standalone":
+        standalone_check(params["name"], params, out)
+    print(HISTORY_MARK + json.dumps(gather_history(params["name"], roots, out)), flush=True)
+    return 0
+
+
+def default_roots():
+    path = os.path.join(HOME, ".config", "git", "repo-roots")
+    if not os.path.exists(path):
+        return [(os.path.join(HOME, "src"), 3)]
+    roots = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 2 and not parts[0].startswith("#"):
+                roots.append((expand(parts[0]), int(parts[1])))
+    # Comments alone mean what a missing file means, or the scan reads nothing and passes.
+    return roots or [(os.path.join(HOME, "src"), 3)]
+
+
+# --- Judging: runs on the machine that runs the audit -----------------------------------
+
+def classify(name, records, owners, mine, since, out):
+    """Turn one machine's history facts into leak findings."""
+    email_account = {o["email"].lower(): o["account"] for o in owners.values()}
+    accounts = {o["account"].lower() for o in owners.values()}
+    patterns = [p.lower() for p in mine]
+
+    def noreply_account(e):
+        """The account a GitHub noreply address belongs to, in either spelling:
+        123+name@users.noreply.github.com or name@users.noreply.github.com."""
+        m = re.match(r"^(?:\d+\+)?([^@]+)@users\.noreply\.github\.com$", e)
+        return m.group(1) if m and m.group(1) in accounts else None
+
+    def is_mine(e):
+        return e in email_account or any(fnmatch.fnmatchcase(e, p) for p in patterns)
+
+    for rec in records:
+        if rec["error"]:
+            out(f"FAIL [history-unreadable] {name} {rec['path']}: git log failed")
+            continue
+        routed = [o for o in rec["owners"] if o in owners]
+        if rec["include"]:
+            inc_email = rec["include"][1].lower()
+            expected = {inc_email}
+            acct = email_account.get(inc_email) or noreply_account(inc_email)
+            accounts_here = {acct} if acct else set()
+        elif len(routed) == 1:
+            expected = {owners[routed[0]]["email"].lower()}
+            accounts_here = {owners[routed[0]]["account"]}
+        else:
+            expected = set()
+            accounts_here = {owners[o]["account"] for o in routed}
+        ownerless = not routed and not rec["include"]
+        for email, (n, first, last) in sorted(rec["emails"].items()):
+            e = email.lower()
+            acct = noreply_account(e)
+            if acct and (ownerless or acct in accounts_here):
+                continue      # a public noreply address, in its own account's repo or an ownerless one
+            if is_mine(e) and e not in expected:
+                if last >= since:
+                    out(f"FAIL [leak-new] {name} {rec['path']}: {email} ({n} times, newest {last})")
+                else:
+                    out(f"[leak-old] {name} {rec['path']}: {email} ({n} times, {first}..{last})")
+
+
+def read_audit_config():
+    path = os.path.join(HOME, ".config", "git", "audit")
+    if not os.path.exists(path):
+        die('no ~/.config/git/audit; see the dotfiles repo, docs/git-identity.md: "Audit every machine"')
+    conf = {"machines": [], "standalone": {}, "mine": [], "since": None}
+    problems = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            words = line.split()
+            if not words or words[0].startswith("#"):
+                continue
+            if words[0] == "machine" and len(words) >= 4:
+                if words[3] not in ("component", "standalone"):
+                    problems.append(f"unknown machine kind {words[3]!r}: {line.strip()}")
+                roots = []
+                for spec in words[4:]:
+                    root, _, depth = spec.rpartition(":")
+                    if not root or not depth.isdigit():
+                        problems.append(f"a root must be <path>:<depth>: {spec}")
+                        continue
+                    roots.append((root, int(depth)))
+                conf["machines"].append({"name": words[1], "where": words[2], "kind": words[3], "roots": roots})
+            elif words[0] == "standalone-accounts" and len(words) >= 3:
+                conf["standalone"][words[1]] = words[2:]
+            elif words[0] == "mine" and len(words) == 2:
+                conf["mine"].append(words[1])
+            elif words[0] == "since" and len(words) == 2:
+                try:
+                    conf["since"] = datetime.date.fromisoformat(words[1]).isoformat()
+                except ValueError:
+                    problems.append(f"since must be a YYYY-MM-DD date: {words[1]}")
+            else:
+                problems.append(f"can't read this line: {line.strip()}")
+    if not conf["machines"]:
+        problems.append("no machine lines")
+    if conf["since"] is None and not any(p.startswith("since") for p in problems):
+        problems.append("no since line")
+    for m in conf["machines"]:
+        if m["kind"] == "standalone" and m["name"] not in conf["standalone"]:
+            problems.append(f"standalone machine {m['name']} has no standalone-accounts line")
+    if problems:
+        die("~/.config/git/audit: " + "; ".join(problems))
+    return conf
+
+
+def die(message):
+    print(f"git-identity-audit: {message}", file=sys.stderr)
+    sys.exit(2)
+
+
+def read_routing():
+    """owner -> {account, name, email}, from this machine's installed routing."""
+    cfg = os.path.join(HOME, ".config", "git", "config")
+    owners = {}
+    rc, out = git(["config", "--file", cfg, "--get-regexp", r"^url\..*\.insteadof$"])
+    for line in out.splitlines():
+        m = re.match(r"^url\.git@github-([A-Za-z0-9-]+):([^/]+)/\.insteadof\s", line, re.I)
+        if m:
+            owners.setdefault(m.group(2), {})["account"] = m.group(1)
+    rc, out = git(["config", "--file", cfg, "--get-regexp", r"^includeif\..*\.path$"])
+    for line in out.splitlines():
+        key, _, value = line.partition(" ")
+        o = owner_of(key.split("url:", 1)[1]) if "url:" in key else None
+        if o in owners:
+            f = expand(value.strip())
+            _, email = git(["config", "--file", f, "user.email"])
+            _, nm = git(["config", "--file", f, "user.name"])
+            _, key = git(["config", "--file", f, "user.signingkey"])
+            owners[o].update(email=email.strip(), name=nm.strip(), signingkey=key.strip())
+    return {o: v for o, v in owners.items() if "email" in v}
+
+
+def gather_on(machine, params):
+    """Run gather() on a machine: in this process for 'local', else this file over ssh."""
+    if machine["where"] == "local":
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            gather(json.loads(json.dumps(params)))
+        return 0, buf.getvalue()
+    with open(os.path.abspath(__file__), encoding="utf-8") as f:
+        source = f.read()
+    cmd = f"python3 - --gather {shlex.quote(json.dumps(params))}"
+    rc, out, err = run(["ssh", "-o", "BatchMode=yes", machine["where"], cmd], stdin_text=source, timeout=1800)
+    return rc, out + err
+
+
+def audit_machine(m, conf, owners, live, out):
+    if m["kind"] == "component":
+        check = ["--live"] if live else []
+        if m["where"] == "local":
+            rc, so, se = run([os.path.join(HOME, ".local", "bin", "git-identity-check")] + check, timeout=1800)
+        else:
+            rc, so, se = run(["ssh", "-o", "BatchMode=yes", m["where"],
+                              "bash -lc " + shlex.quote("~/.local/bin/git-identity-check " + " ".join(check))],
+                             timeout=1800)
+        if rc == 0:
+            out(f"{m['name']}: setup ok")
+        else:
+            out(f"FAIL [check] {m['name']}: git-identity-check exited {rc}")
+            for l in (so + se).splitlines():
+                if l.startswith("FAIL") or rc == 255:
+                    out("    " + l)
+        params = {"name": m["name"], "kind": "component", "roots": m["roots"] or None}
+    else:
+        accounts = conf["standalone"][m["name"]]
+        allowed = {o: v for o, v in owners.items() if v["account"] in accounts}
+        params = {"name": m["name"], "kind": "standalone", "roots": m["roots"] or None,
+                  "owners": allowed, "accounts": accounts, "live": live}
+    rc, text = gather_on(m, params)
+    if rc != 0:
+        out(f"FAIL [unreachable] {m['name']}: gathering on {m['where']} exited {rc}")
+        for l in text.strip().splitlines()[-5:]:
+            out("    " + l)
+        return
+    records = None
+    for line in text.splitlines():
+        if line.startswith(HISTORY_MARK):
+            records = json.loads(line[len(HISTORY_MARK):])
+        elif line.strip():
+            out(line)
+    if records is None:
+        out(f"FAIL [unreachable] {m['name']}: no history facts came back")
+        return
+    classify(m["name"], records, owners, conf["mine"], conf["since"], out)
+
+
+def main(argv):
+    if argv[:1] == ["--gather"]:
+        return gather(json.loads(argv[1]))
+    if [a for a in argv if a != "--offline"]:
+        print("usage: git-identity-audit [--offline]", file=sys.stderr)
+        return 2
+    conf = read_audit_config()
+    owners = read_routing()
+    failures = 0
+
+    def out(line):
+        nonlocal failures
+        print(line, flush=True)
+        if line.startswith("FAIL"):
+            failures += 1
+
+    for m in conf["machines"]:
+        print(f"=== {m['name']}")
+        audit_machine(m, conf, owners, "--offline" not in argv, out)
+    print(f"\n{failures} failure(s)." if failures else "\nall machines passed")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""Check that this machine routes every GitHub owner to the right account.
+
+The identity component (the routing config, one identity file per owner and the SSH
+aliases, installed by `setup.sh --git-identity`) only works if nothing else on the machine overrides it. This check looks for every way that can drift:
+an identity left in ~/.gitconfig, a second SSH key reaching a GitHub alias, a missing
+key, a repo whose owner is ambiguous, a repo that switched signing off. It fails loudly,
+naming each cause with a tag such as [ssh-include], and points at docs/git-identity.md in the dotfiles repo.
+
+Offline by default: it reads config and repos and touches no network. `--live` adds one
+`ssh -T` probe per alias and classifies the answer as logged in, refused or
+inconclusive. An inconclusive probe (a timeout, a host-key failure) is a failure, never
+a pass, because "couldn't reach GitHub" says nothing about which key it would accept.
+
+Repos it lists as "[no-identity]" (no remote, only local-path remotes, or only unrouted
+owners) are information, not failures: refusing to commit there is the intended
+behavior.
+
+The owners file, ~/.config/git/owners, says which owners and aliases to check. It is
+installed from the data folder with the rest of the component. Blank lines and lines
+starting with # are ignored, and every other line is one of:
+
+  owner <owner> <SSH alias> <identity file>
+  alias <SSH alias> <account>
+
+For example, for an account `octocat` that also reaches an organization `octo-org`:
+
+  owner octocat github-octocat identity-octocat
+  owner octo-org github-octocat identity-octo-org
+  alias github.com octocat
+  alias github-octocat octocat
+
+An `owner` line routes one GitHub owner: its repos use that alias, and commit as that
+identity file in ~/.config/git. An `alias` line says whose key the alias must use
+(~/.ssh/id_ed25519_<account>) and whose login it must answer with. Owners and accounts
+are GitHub names. An owner's alias is `github-<name>` and needs its own `alias` line, the
+alias `github-<name>` must map to the account `<name>`, an identity file is named
+`identity-<name>`, and plain `github.com` needs an `alias` line too, naming any account,
+because ssh uses it for every repo no owner line covers. A missing file, one with no
+owners or a line that breaks these rules fails with [owners], since the check has nothing
+to compare the machine against.
+
+Machine-local inputs, both untracked:
+  ~/.config/git/accounts    the accounts this machine is meant to have, one per line
+  ~/.config/git/repo-roots  "<path> <depth>" lines to scan; "~/src 3" when absent
+
+A file holding only comments counts as absent, so an unedited template can't pass by
+checking nothing.
+
+GIT_IDENTITY_CHECK_SSH_CONFIG names the SSH config to read instead of ~/.ssh/config, so
+the tests can point ssh at a fixture with `ssh -F`.
+"""
+
+import os
+import pwd
+import re
+import subprocess
+import sys
+import tempfile
+
+RUNBOOK = 'dotfiles repo, docs/git-identity.md: "The check failed"'
+
+# Filled by load_owners(), from the owners file.
+# owner -> (SSH alias, identity file)
+OWNERS = {}
+# alias -> the account whose key it must use and whose login it must answer with
+ALIASES = {}
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
+OWNER_ALIAS_RE = re.compile(r"^github-[A-Za-z0-9][A-Za-z0-9-]*$")
+IDENTITY_FILE_RE = re.compile(r"^identity-[A-Za-z0-9._-]+$")
+IDENTITY_ENV = ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL", "EMAIL")
+
+HOME = os.environ.get("HOME", "")
+PW_HOME = pwd.getpwuid(os.getuid()).pw_dir
+CONF = os.path.join(HOME, ".config", "git")
+
+failures = 0
+
+
+def fail(tag, message):
+    global failures
+    failures += 1
+    print(f"FAIL [{tag}] {message}")
+
+
+def info(tag, message):
+    print(f"[{tag}] {message}")
+
+
+def run(args, cwd=None):
+    """Run a command; return (exit status, stdout). Never raises on a non-zero exit."""
+    try:
+        p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, str(e)
+    return p.returncode, p.stdout
+
+
+def git(args, cwd=None):
+    return run(["git"] + args, cwd=cwd)
+
+
+def tilde(path):
+    """Spell a path under the home directory as ~/…, whichever home produced it.
+
+    ssh expands ~ with the password-database home, while this process may run with a
+    different $HOME (the tests do), so both prefixes are folded to the same form.
+    """
+    for prefix in (HOME, PW_HOME):
+        if prefix and path.startswith(prefix + "/"):
+            return "~/" + path[len(prefix) + 1:]
+    return path
+
+
+def expand(path):
+    return os.path.join(HOME, path[2:]) if path.startswith("~/") else path
+
+
+def read_lines(path):
+    with open(path, encoding="utf-8") as f:
+        return [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")]
+
+
+# --- The owners file --------------------------------------------------------------
+
+def load_owners():
+    """Fill OWNERS and ALIASES from the owners file. False when they can't be trusted."""
+    path = os.path.join(CONF, "owners")
+    try:
+        lines = read_lines(path)
+    except FileNotFoundError:
+        fail("owners", "~/.config/git/owners is missing: run setup.sh --git-identity")
+        return False
+    except (OSError, UnicodeDecodeError) as e:
+        fail("owners", f"~/.config/git/owners can't be read: {e}")
+        return False
+    good = True
+
+    def bad(line, why):
+        nonlocal good
+        good = False
+        fail("owners", f"~/.config/git/owners line `{line}`: {why}")
+
+    for line in lines:
+        words = line.split()
+        if words[0] == "owner" and len(words) == 4:
+            _, owner, alias, ident = words
+            if not NAME_RE.match(owner):
+                bad(line, "the owner is not a GitHub name")
+            elif not OWNER_ALIAS_RE.match(alias):
+                bad(line, "the SSH alias must be github-<name>")
+            elif not IDENTITY_FILE_RE.match(ident):
+                bad(line, "the identity file must be named identity-<name>")
+            elif owner in OWNERS:
+                bad(line, "this owner already has a line")
+            else:
+                OWNERS[owner] = (alias, ident)
+        elif words[0] == "alias" and len(words) == 3:
+            _, alias, account = words
+            if alias != "github.com" and not OWNER_ALIAS_RE.match(alias):
+                bad(line, "the SSH alias must be github.com or github-<name>")
+            elif not NAME_RE.match(account):
+                bad(line, "the account is not a GitHub name")
+            elif alias != "github.com" and alias != f"github-{account}":
+                # git-identity-audit reads the account off the alias, so the two can't differ.
+                bad(line, "the alias github-<name> must map to the account <name>")
+            elif alias in ALIASES:
+                bad(line, "this alias already has a line")
+            else:
+                ALIASES[alias] = account
+        else:
+            bad(line, "expected `owner <owner> <SSH alias> <identity file>` or "
+                      "`alias <SSH alias> <account>`")
+    if not OWNERS and good:
+        fail("owners", "~/.config/git/owners has no owners, so there is nothing to check")
+        return False
+    if "github.com" not in ALIASES and good:
+        good = False
+        fail("owners", "~/.config/git/owners has no `alias github.com <account>` line")
+    for owner, (alias, ident) in OWNERS.items():
+        if alias not in ALIASES:
+            bad(f"owner {owner} {alias} {ident}", f"{alias} has no `alias` line")
+    if good:
+        # The tables can still be used without this file, so the other checks still run.
+        for ident in sorted({i for _, i in OWNERS.values()}):
+            if not os.path.exists(os.path.join(CONF, ident)):
+                fail("owners", f"~/.config/git/owners names {ident}, but "
+                               f"~/.config/git/{ident} is missing")
+    return good
+
+
+# --- Layout and environment -------------------------------------------------------
+
+def check_layout():
+    if "GIT_CONFIG_GLOBAL" in os.environ:   # set at all, even empty, is an override
+        fail("layout", "GIT_CONFIG_GLOBAL is set: it replaces ~/.config/git/config and "
+                       "~/.gitconfig, so the component is not read")
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg and os.path.realpath(xdg) != os.path.realpath(os.path.join(HOME, ".config")):
+        fail("layout", f"XDG_CONFIG_HOME is {xdg}, not ~/.config: git would look for the "
+                       "component somewhere else")
+    if not os.path.exists(os.path.join(CONF, "config")):
+        fail("layout", "~/.config/git/config is missing: run setup.sh --git-identity")
+
+
+def check_env():
+    for name in IDENTITY_ENV:
+        if os.environ.get(name):
+            fail("env-identity", f"{name} is set in the environment; git prefers it to "
+                                 "every identity file")
+
+
+def check_gitconfig():
+    path = os.path.join(HOME, ".gitconfig")
+    if not os.path.exists(path):
+        return
+    rc, out = git(["config", "--file", path, "--name-only", "--list"])
+    for key in out.split():
+        k = key.lower()
+        if k in ("user.name", "user.email", "user.signingkey") or \
+                k.startswith("author.") or k.startswith("committer."):
+            fail("gitconfig-identity", f"~/.gitconfig sets {key}; identities belong only "
+                                       "in the component's identity files")
+        elif k.startswith("includeif.") or (k.startswith("url.") and
+                                            k.endswith((".insteadof", ".pushinsteadof"))):
+            fail("gitconfig-rules", f"~/.gitconfig still has {key}; routing belongs only "
+                                    "in the component's git/config")
+
+
+def check_unconditional_identity(scratch):
+    """Outside any repo no owner rule can match, so any identity seen is unconditional."""
+    for scope in ("--global", "--system"):
+        # --includes: a plain [include] of an identity file is just as unconditional,
+        # and scoped queries don't follow includes by default.
+        rc, out = git(["config", scope, "--includes", "--show-origin", "--get-regexp",
+                       r"^(user\.(name|email|signingkey)|author\..*|committer\..*)$"],
+                      cwd=scratch)
+        for line in out.splitlines():
+            fail("unconditional-identity", f"an identity applies to every repo ({line.strip()})")
+
+
+def check_local_file():
+    path = os.path.join(CONF, "local")
+    if not os.path.exists(path):
+        return
+    rc, out = git(["config", "--file", path, "--name-only", "--list"])
+    for key in out.split():
+        if not key.lower().startswith("gpg."):
+            fail("local-file", f"~/.config/git/local sets {key}; only gpg.* settings may "
+                               "go there, since it is read after every identity")
+
+
+# --- SSH and keys -----------------------------------------------------------------
+
+def ssh_config_path():
+    return os.environ.get("GIT_IDENTITY_CHECK_SSH_CONFIG") or os.path.join(HOME, ".ssh", "config")
+
+
+def ssh_base():
+    override = os.environ.get("GIT_IDENTITY_CHECK_SSH_CONFIG")
+    return ["ssh", "-F", override] if override else ["ssh"]
+
+
+def check_ssh_include():
+    path = ssh_config_path()
+    if not os.path.exists(path):
+        fail("ssh-include", f"{tilde(path)} does not exist; it needs an Include of "
+                            "config.d/github.conf")
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            # OpenSSH accepts `Keyword value`, `Keyword=value` and quoted values.
+            words = line.replace("=", " ", 1).replace('"', " ").split()
+            if not words or words[0].startswith("#"):
+                continue
+            keyword = words[0].lower()
+            if keyword == "include" and any(w.endswith("config.d/github.conf") for w in words[1:]):
+                return
+            if keyword in ("host", "match"):
+                break
+    fail("ssh-include", f"{tilde(path)} has no `Include config.d/github.conf` before its "
+                        "first Host or Match line")
+
+
+def check_ssh_identityfiles():
+    for alias, account in ALIASES.items():
+        want = f"~/.ssh/id_ed25519_{account}"
+        rc, out = run(ssh_base() + ["-G", alias])
+        got = [tilde(l.split(None, 1)[1]) for l in out.splitlines()
+               if l.lower().startswith("identityfile ")]
+        only = [l.split(None, 1)[1] for l in out.splitlines()
+                if l.lower().startswith("identitiesonly ")]
+        if only != ["yes"]:
+            fail("ssh-identitiesonly", f"{alias} has IdentitiesOnly {only[0] if only else 'unset'}; "
+                                       "an earlier `IdentitiesOnly no` wins and lets agent keys "
+                                       "be offered")
+        if got != [want]:
+            fail("ssh-identityfile", f"{alias} would offer {got or 'no key'}, not exactly "
+                                     f"[{want}]; IdentityFile lines from every matching "
+                                     "block (Host * included) add up")
+
+
+def declared_accounts():
+    path = os.path.join(CONF, "accounts")
+    accounts = set(read_lines(path)) if os.path.exists(path) else set()
+    if not accounts:
+        fail("accounts", "~/.config/git/accounts is missing or lists nothing; list the "
+                         "accounts this machine is meant to have, one per line")
+        return set()
+    for a in accounts - set(ALIASES.values()):
+        fail("accounts", f"~/.config/git/accounts names unknown account {a}")
+    return accounts
+
+
+def check_keys(accounts):
+    for a in sorted(accounts):
+        key = os.path.join(HOME, ".ssh", f"id_ed25519_{a}")
+        for path in (key, key + ".pub"):
+            if not os.path.exists(path):
+                fail("key-missing", f"declared account {a} has no {tilde(path)}")
+
+
+# --- Rewrites ---------------------------------------------------------------------
+
+def check_rewrites(scratch):
+    for owner, (alias, _) in OWNERS.items():
+        want = f"git@{alias}:{owner}/x.git"
+        for url in (f"git@github.com:{owner}/x.git", f"https://github.com/{owner}/x.git",
+                    f"ssh://git@github.com/{owner}/x.git"):
+            rc, out = git(["ls-remote", "--get-url", url], cwd=scratch)
+            got = out.strip()
+            if got != want:
+                tag = "https-route" if got.startswith("https://") else "rewrite"
+                fail(tag, f"{url} resolves to {got or 'nothing'}, not {want}")
+
+
+# --- Repo scan --------------------------------------------------------------------
+
+OWNER_RE = [
+    re.compile(r"^git@github\.com:([^/]+)/"),
+    re.compile(r"^https://(?:[^@/]+@)?github\.com/([^/]+)/"),
+    re.compile(r"^ssh://git@github\.com/([^/]+)/"),
+    re.compile(r"^git@github-[A-Za-z0-9-]+:([^/]+)/"),
+]
+
+
+def owner_of(url):
+    """The GitHub owner a remote URL names; None for a local path or another host."""
+    for r in OWNER_RE:
+        m = r.match(url)
+        if m:
+            return m.group(1)
+    if "://" not in url and ":" in url.split("/", 1)[0]:
+        return "<other-host>"   # scp-style host:path on some other server
+    if "://" in url and not url.startswith("file://"):
+        return "<other-host>"
+    return None                 # a local path or file:// URL has no owner
+
+
+def identities():
+    out = {}
+    for owner, (_, ident) in OWNERS.items():
+        path = os.path.join(CONF, ident)
+        rc, text = git(["config", "--file", path, "--list"])
+        values = dict(l.split("=", 1) for l in text.splitlines() if "=" in l)
+        out[ident] = (values.get("user.name"), values.get("user.email"), values.get("user.signingkey"))
+    return out
+
+
+def roots():
+    path = os.path.join(CONF, "repo-roots")
+    lines = read_lines(path) if os.path.exists(path) else []
+    if not lines:
+        return [(os.path.join(HOME, "src"), 3)]
+    result = []
+    for line in lines:
+        parts = line.split()
+        try:
+            root = HOME if parts[0] == "~" else expand(parts[0])
+            result.append((root, int(parts[1])))
+        except (IndexError, ValueError):
+            fail("repo-roots", f"~/.config/git/repo-roots line is not `<path> <depth>`: {line}")
+    return result
+
+
+def find_repos(root, depth):
+    """Working trees, bare repos and linked worktrees within `depth` levels of root."""
+    found = []
+
+    def walk(d, level):
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            # Reported, not failed: macOS denies listing ~/.Trash, which a `~ 1` root
+            # reaches, and that would fail the check on every macOS machine.
+            info("unreadable", d)
+            return
+        # A repo the way git sees one: a .git FILE (a worktree's gitdir pointer) or a
+        # .git folder holding HEAD (a file, or a symlink even if dangling, as before a
+        # first commit in older layouts). A .git folder without HEAD is debris that git
+        # itself ignores, and must not be reported as an unreadable repo.
+        dotgit = os.path.join(d, ".git")
+        if os.path.isfile(dotgit) or os.path.lexists(os.path.join(dotgit, "HEAD")) or (os.path.isfile(os.path.join(d, "HEAD"))
+                                 and os.path.isdir(os.path.join(d, "objects"))
+                                 and os.path.isdir(os.path.join(d, "refs"))):
+            found.append(d)
+        if level >= depth:
+            return
+        for e in sorted(entries):
+            p = os.path.join(d, e)
+            if e in (".git", "node_modules") or os.path.islink(p) or not os.path.isdir(p):
+                continue
+            walk(p, level + 1)
+
+    walk(root, 0)
+    return found
+
+
+def check_repo(path, idents, verbose):
+    rc, out = git(["config", "--local", "--get-regexp", r"^remote\..*\.(url|pushurl)$"], cwd=path)
+    owners = set()
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            o = owner_of(parts[1].strip())
+            if o:
+                owners.add(o)
+    # Owners also come from where each remote really goes, after every rewrite: a
+    # pushInsteadOf can send a push to another owner, or off GitHub, while the URL as
+    # written still looks right.
+    rc, names = git(["remote"], cwd=path)
+    resolved = {}
+    for remote in names.split():
+        rc, fetch = git(["ls-remote", "--get-url", remote], cwd=path)
+        rc, push = git(["remote", "get-url", "--all", "--push", remote], cwd=path)
+        rc, raw = git(["config", "--get-all", f"remote.{remote}.url"], cwd=path)
+        rc, rawpush = git(["config", "--get-all", f"remote.{remote}.pushurl"], cwd=path)
+        resolved[remote] = (raw.split() + rawpush.split(), fetch.split() + push.split())
+        for url in fetch.split() + push.split():
+            o = owner_of(url)
+            if o:
+                owners.add(o)
+    routed = owners & set(OWNERS)
+    # Every GitHub owner counts toward "mixed", routed or not; other hosts don't.
+    github_owners = {o for o in owners if o != "<other-host>"}
+    rc, local_includes = git(["config", "--local", "--get-all", "include.path"], cwd=path)
+    # Only an include that resolves to one of the component's identity files counts. An
+    # include of a missing or foreign file supplies nothing, so it must not silence the
+    # ambiguity report.
+    valid = {os.path.realpath(os.path.join(CONF, ident)): ident for _, ident in OWNERS.values()}
+    # Git resolves a relative include.path against the directory of the config file that
+    # names it (the repo's common git dir), never against this process's cwd.
+    rc, common = git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=path)
+    base = common.strip() or path
+
+    def resolve(p):
+        p = expand(p)
+        return os.path.realpath(p if os.path.isabs(p) else os.path.join(base, p))
+
+    included = [valid[resolve(p)] for p in local_includes.split() if resolve(p) in valid]
+    rc, local_ident = git(["config", "--local", "--get-regexp",
+                           r"^(user\.(name|email|signingkey)|author\..*|committer\..*)$"], cwd=path)
+
+    if local_ident.strip():
+        fail("repo-local-identity", f"{path}: sets {', '.join(l.split()[0] for l in local_ident.splitlines())} "
+                                    "itself; give it a whole identity with `git config --local "
+                                    "include.path ~/.config/git/identity-<name>` instead")
+    if not included and routed and len(github_owners) > 1:
+        fail("repo-ambiguous", f"{path}: remotes or push URLs name {', '.join(sorted(github_owners))}; "
+                               "pick one with an identity include")
+    # The repo's REAL destinations, after every rewrite including repo-local ones. A
+    # remote written for a routed owner must resolve, for fetch AND every push URL, to a
+    # routed alias: one correct fetch URL must not excuse a push sent elsewhere.
+    for remote, (configured, destinations) in resolved.items():
+        if not any(owner_of(u) in OWNERS for u in configured):
+            continue
+        for url in destinations:
+            o = owner_of(url)
+            if o not in OWNERS or not url.startswith(f"git@{OWNERS[o][0]}:{o}/"):
+                fail("repo-route", f"{path}: remote {remote} goes to {url}, which is not a "
+                                   "routed alias")
+
+    def var(name):
+        rc, out = git(["var", name], cwd=path)
+        return re.sub(r" \d+ [-+]\d{4}$", "", out.strip()) if rc == 0 else None
+
+    author, committer = var("GIT_AUTHOR_IDENT"), var("GIT_COMMITTER_IDENT")
+    rc, key = git(["config", "user.signingkey"], cwd=path)
+    key = key.strip() or None
+
+    if author is None and not routed and not included:
+        info("no-identity", f"{path} (commits refused)")
+    elif not routed and not included:
+        fail("repo-identity-source", f"{path}: has no routed remote and no identity include, "
+                                     f"yet resolves {author}; that can only be a fallback rule")
+    elif author is None:
+        fail("repo-identity-mismatch", f"{path}: has a routed owner or identity include, "
+                                       "but no identity resolves")
+    else:
+        matches = [n for n, (name, email, k) in idents.items()
+                   if author == f"{name} <{email}>" and committer == author and key == k]
+        if included:
+            expected = included[-1]
+        elif len(routed) == 1:
+            expected = OWNERS[next(iter(routed))][1]
+        else:
+            expected = None
+        if not matches:
+            fail("repo-identity-mismatch", f"{path}: author {author}, committer {committer}, "
+                                           f"key {key} match no single identity file")
+        elif expected and matches[0] != expected:
+            fail("repo-identity-mismatch", f"{path}: resolves to {matches[0]}, expected {expected}")
+    for k, want in (("commit.gpgsign", "true"), ("tag.gpgsign", "true"), ("gpg.format", "ssh")):
+        args = ["config", "--type=bool", k] if k.endswith("gpgsign") else ["config", k]
+        rc, out = git(args, cwd=path)
+        if out.strip() != want:
+            fail("repo-signing", f"{path}: {k} is {out.strip() or 'unset'}, not {want}")
+    rc, out = git(["config", "gpg.ssh.allowedSignersFile"], cwd=path)
+    if tilde(expand(out.strip())) != "~/.config/git/allowed_signers":
+        fail("repo-signing", f"{path}: gpg.ssh.allowedSignersFile is {out.strip() or 'unset'}, "
+                             "not ~/.config/git/allowed_signers")
+    if verbose:
+        print(f"scanned {path}")
+
+
+def check_repos(verbose):
+    """Each repository is checked once, keyed by its resolved git directory.
+
+    A bare-plus-worktrees container and its .bare folder are the same repository, and
+    two overlapping roots can reach one repo twice. Checking each path would report every
+    problem in it more than once.
+    """
+    idents = identities()
+    seen = set()
+    for root, depth in roots():
+        if not os.path.isdir(root):
+            info("root-missing", root)
+            continue
+        for path in find_repos(root, depth):
+            rc, gitdir = git(["rev-parse", "--absolute-git-dir"], cwd=path)
+            if rc != 0:
+                fail("repo-unreadable", f"{path}: looks like a repo but git can't read it")
+                continue
+            if gitdir.strip() in seen:
+                continue
+            seen.add(gitdir.strip())
+            check_repo(path, idents, verbose)
+    print(f"scanned {len(seen)} repos")
+
+
+# --- Live probes ------------------------------------------------------------------
+
+def check_live(accounts):
+    for alias, account in ALIASES.items():
+        try:
+            p = subprocess.run(ssh_base() + ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                                             f"git@{alias}"],
+                               capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            text = p.stdout + p.stderr
+        except (OSError, subprocess.TimeoutExpired) as e:
+            text = str(e)
+        m = re.search(r"Hi ([A-Za-z0-9-]+)!", text)
+        declared = account in accounts
+        if m:
+            login = m.group(1)
+            if not declared:
+                fail("live-refused-expected", f"{alias} logged in as {login}, but {account} is "
+                                              "not declared on this machine and must be refused")
+            elif login != account:
+                fail("live-login", f"{alias} logged in as {login}, not {account}")
+            else:
+                print(f"ok {alias}: logged in as {login}")
+        elif "Permission denied (publickey)" in text:
+            if declared:
+                fail("live-login", f"{alias} was refused, but {account} is declared here")
+            else:
+                print(f"ok {alias}: refused, as required ({account} not declared)")
+        else:
+            first = text.strip().splitlines()[0] if text.strip() else "no output"
+            fail("live-inconclusive", f"{alias}: neither a login nor a refusal ({first})")
+
+
+def main(argv):
+    live = "--live" in argv
+    verbose = "--verbose" in argv
+    unknown = [a for a in argv if a not in ("--live", "--verbose")]
+    if unknown:
+        print("usage: git-identity-check [--live] [--verbose]", file=sys.stderr)
+        return 2
+    with tempfile.TemporaryDirectory() as scratch:
+        owners_ok = load_owners()
+        check_layout()
+        check_env()
+        check_gitconfig()
+        check_unconditional_identity(scratch)
+        check_local_file()
+        check_ssh_include()
+        if owners_ok:
+            check_ssh_identityfiles()
+            accounts = declared_accounts()
+            check_keys(accounts)
+            check_rewrites(scratch)
+            check_repos(verbose)
+            if live:
+                check_live(accounts)
+            else:
+                print("authentication: not tested (run with --live)")
+        else:
+            print("skipped the key, rewrite, repo and login checks: they need the owners file")
+    if failures:
+        print(f"\n{failures} problem(s). Fixes for each tag: {RUNBOOK}")
+        return 1
+    print("\nall checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

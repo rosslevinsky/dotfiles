@@ -1,0 +1,5 @@
+# Test data: a separate account.
+[user]
+	name = Bob
+	email = 1002+bob@users.noreply.github.com
+	signingkey = ~/.ssh/id_ed25519_bob

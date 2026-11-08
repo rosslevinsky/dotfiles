@@ -1,0 +1,33 @@
+# Guidance for settings-overlay.json, beside this file. JSON has no comments, so it is here.
+#
+# setup.sh builds ~/.claude/settings.json from this repo's base settings with that overlay on
+# top. Objects merge key by key, and any other value replaces the base's, arrays included. A
+# copy of `permissions.allow` must therefore list every rule you want. Left as `{}`, the
+# overlay changes nothing.
+#
+# To fill in: add your own keys to settings-overlay.json, as strict JSON. An example, with what
+# each key does after it. Copy only the keys you want, and change the values:
+#
+# --- example begins
+#   {
+#     "model": "sonnet",
+#     "theme": "dark",
+#     "permissions": {
+#       "allow": ["Bash(git status)", "Bash(git diff:*)", "Read(*)"],
+#       "deny": ["Read(./.env)", "Read(./secrets/**)"]
+#     },
+#     "env": { "EXAMPLE_VARIABLE": "1" }
+#   }
+# --- example ends
+#
+#   model        the model a new session starts with
+#   theme        the terminal colors Claude Code uses
+#   permissions  allow: what runs without asking you; deny: what is refused even if allowed.
+#                Each rule is a tool name with an optional pattern in parentheses
+#   env          environment variables set in every session
+#
+# Keep anything secret out of this file, since it lives in a repo: no tokens or keys in "env".
+#
+# To check: run setup.sh, then read ~/.claude/settings.json. If you changed that file directly,
+# setup.sh shows the difference and stops. Move the change to the overlay and run it again, or
+# pass --force-settings to discard it.

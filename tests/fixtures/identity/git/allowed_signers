@@ -1,0 +1,2 @@
+# Test data: holds no keys. The suites generate throwaway keys and verify against a signer
+# file of their own, passed with -c, so nothing here can vouch for a commit.

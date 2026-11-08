@@ -1,0 +1,17 @@
+# Test data: fictional accounts for the identity suites.
+#
+#   alice  the main account, which plain github.com logs in as
+#   acme   an organization reached with alice's key, with its own identity
+#   bob    a separate account with its own key
+#   carol  a declared account that a machine may not have
+#
+# owner <owner> <SSH alias> <identity file>
+owner alice github-alice identity-alice
+owner acme github-alice identity-acme
+owner bob github-bob identity-bob
+owner carol github-carol identity-carol
+# alias <SSH alias> <account whose key it uses and whose login it answers with>
+alias github.com alice
+alias github-alice alice
+alias github-bob bob
+alias github-carol carol

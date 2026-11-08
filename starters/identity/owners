@@ -1,0 +1,15 @@
+# Who the git identity component routes. Nothing here is active until you edit it, and a
+# plain setup.sh run ignores this file.
+#
+# To fill in: remove `#> ` from the suggested lines below and change alice to your GitHub
+# account. Add an `owner` line for each account or organization to route, and an `alias` line
+# for each SSH alias. An organization may reuse an account's alias with its own identity file.
+#
+# To check: run `setup.sh --git-identity`, which installs this folder, and then
+# `~/.local/bin/git-identity-check`.
+#
+# owner <owner> <SSH alias> <identity file>
+#> owner alice github-alice identity-alice
+# alias <SSH alias> <account whose key it uses and whose login it answers with>
+#> alias github.com alice
+#> alias github-alice alice

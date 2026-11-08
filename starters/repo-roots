@@ -1,0 +1,10 @@
+# Where git-identity-check looks for repos: `<path> <depth>` lines. With no lines it looks in
+# `~/src 3`, and a file holding only comments counts as missing.
+#
+# To fill in: remove `#> ` from the suggested line below and change the path to the folder
+# holding your repos. The depth is how many folders down the repos sit: 2 finds
+# ~/code/<owner>/<repo>.
+#
+# To check: run `~/.local/bin/git-identity-check --verbose`, which lists each repo it scanned.
+#
+#> ~/code 2

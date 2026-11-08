@@ -1,0 +1,5 @@
+# Test data: an organization, signing with alice's key, with its own name and real address.
+[user]
+	name = Alice Example
+	email = alice@acme.example
+	signingkey = ~/.ssh/id_ed25519_alice

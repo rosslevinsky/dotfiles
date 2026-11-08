@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+#
+# gh-as <account> <gh arguments…>
+#
+# Runs one gh command as <account> on github.com, without changing gh's active account.
+#
+# Git routes each owner to the right account by itself, but gh has no such
+# routing: every gh command acts as whichever account `gh auth switch` last chose. This
+# looks up <account>'s stored token and hands it to a single gh run in GH_TOKEN, so
+#   gh-as bob pr create …
+# opens the PR as bob whatever account is active.
+#
+# github.com only, as far as the AMBIENT environment goes: a GH_HOST or host-qualified
+# GH_REPO naming another host is refused, because gh would send this token there and
+# nobody typing the command would see why.
+#
+# Hosts named on the command line (--hostname, -R, a positional repo, a full API URL)
+# are deliberately not policed. Anyone who can run gh-as can already print the same
+# token with `gh auth token --user <account>`, so gh-as is no boundary against its own
+# caller. A scan of gh's arguments can't be complete either: it misses positional and
+# URL forms, and it rejects ordinary text such as a PR body mentioning --hostname.
+#
+# The token is never printed by gh-as itself: tracing is switched off first, a failed
+# lookup reports the account and not gh's output, and `gh-as … auth …` is refused,
+# since `auth token` would print exactly the token being injected.
+
+# Tracing first, before anything touches the token: under `bash -x`, or an inherited
+# xtrace, every line below would be echoed to stderr with the token expanded in it.
+set +x
+set -euo pipefail
+
+usage() { echo "usage: gh-as <account> <gh arguments…>" >&2; exit 2; }
+[ "$#" -ge 2 ] || usage
+account="$1"; shift
+# A GitHub login: letters, digits and hyphens. An empty name matters most: gh resolves
+# `--user ""` to the ACTIVE account's token, the very thing gh-as exists to avoid.
+if ! [[ "$account" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]]; then
+  echo "gh-as: '$account' is not a GitHub account name" >&2
+  exit 2
+fi
+
+if [ "$1" = "auth" ]; then
+  echo "gh-as: 'gh auth' manages stored logins; run it directly, not through gh-as" >&2
+  exit 2
+fi
+
+foreign_repo() {  # HOST/OWNER/REPO with a host other than github.com
+  local first second third
+  IFS=/ read -r first second third <<<"$1" || true
+  [ -n "${third:-}" ] && [ "$first" != "github.com" ]
+}
+
+if [ -n "${GH_HOST:-}" ] && [ "$GH_HOST" != "github.com" ]; then
+  echo "gh-as: GH_HOST is $GH_HOST; gh-as only works with github.com" >&2
+  exit 2
+fi
+# GH_REPO is OWNER/REPO, or HOST/OWNER/REPO; only the second form names a host.
+if [ -n "${GH_REPO:-}" ] && foreign_repo "$GH_REPO"; then
+  echo "gh-as: GH_REPO $GH_REPO names another host; gh-as only works with github.com" >&2
+  exit 2
+fi
+
+# The lookup's own output is discarded on failure: it would be the only place a token
+# could appear on screen.
+if ! token="$(gh auth token --hostname github.com --user "$account" 2>/dev/null)" || [ -z "$token" ]; then
+  echo "gh-as: no stored token for account '$account' on github.com (see: gh auth status)" >&2
+  exit 1
+fi
+
+GH_TOKEN="$token" exec gh "$@"

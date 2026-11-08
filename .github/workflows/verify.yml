@@ -1,0 +1,124 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# The failures these suites look for are silent: a link that stops resolving, an
+# instruction naming a repository that doesn't exist, a check whose assertion has
+# stopped meaning anything. Nothing surfaces them until someone goes looking, so they
+# run on every push rather than only when someone remembers.
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Codex guard decisions
+        run: python -m unittest discover -s tests -p 'test_*.py'
+
+      - name: setup.sh against a throwaway HOME
+        run: bash tests/test_setup.sh
+
+      - name: Status line wraps to the terminal width
+        run: bash tests/test_statusline.sh
+
+      - name: Git identity routing, on hand-placed files
+        run: bash tests/test_git_identity.sh
+
+      - name: Git identity routing, as setup.sh --git-identity installs it
+        run: bash tests/test_git_identity.sh installed
+
+      - name: git-identity-check names each kind of drift
+        run: bash tests/test_git_identity_check.sh
+
+      - name: gh-as runs one command as an account, never showing the token
+        run: bash tests/test_gh_as.sh
+
+      - name: git-identity-audit checks every machine and scans history
+        run: bash tests/test_git_identity_audit.sh
+
+      - name: The sample private-layer wrapper installs a private repo on top
+        run: bash tests/test_private_layer.sh
+
+      # Needs the API to answer "does this repository exist". The URLs the README names
+      # are public, so the default token is enough.
+      - name: README names things that exist
+        run: bash tests/test_readme_commands.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # Run bare on a runner, which has no instructions, the budget check reports a session
+      # total of 0 and exits OK. This suite installs into a throwaway HOME and checks the
+      # figures against the files, including a workspace file another repo would install.
+      # The budget check needs Bash 4 or newer, which a macOS runner may not put first.
+      - name: Line budget measures what is installed
+        run: |
+          if ! bash -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]'; then
+            brew install bash
+            PATH="$(brew --prefix)/bin:$PATH"
+            export PATH
+            hash -r
+          fi
+          bash tests/test_line_budget.sh
+
+  # One version, checked against the checksum its project publishes, so a new gitleaks can't
+  # change this result or reach the runner unnoticed.
+  gitleaks:
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the pinned gitleaks
+        run: |
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          dir="$(mktemp -d)"
+          curl -fsSL -o "$dir/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$archive"
+          echo "$GITLEAKS_SHA256  $dir/$archive" | sha256sum -c -
+          tar -xzf "$dir/$archive" -C "$dir" gitleaks
+          echo "$dir" >> "$GITHUB_PATH"
+
+      - name: No secrets in the tree
+        run: gitleaks dir . --ignore-gitleaks-allow --no-banner --redact --exit-code 1
+
+  # Ubuntu 24.04's own git is 2.43, and the identity routing depends on `hasconfig:` includes
+  # and `insteadOf` behavior that changes between git versions. The hosted runners carry a
+  # newer git, so the identity suites also run here, on the distro's packages. The image
+  # ships without python3, which git-identity-check needs.
+  identity-git-2-43:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - name: Distro git, OpenSSH and Python
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git openssh-client python3 >/dev/null
+          git --version
+
+      - uses: actions/checkout@v4
+
+      - name: Git identity routing, on hand-placed files
+        run: bash tests/test_git_identity.sh
+
+      - name: Git identity routing, as setup.sh --git-identity installs it
+        run: bash tests/test_git_identity.sh installed
+
+      - name: git-identity-check names each kind of drift
+        run: bash tests/test_git_identity_check.sh
+
+      - name: git-identity-audit checks every machine and scans history
+        run: bash tests/test_git_identity_audit.sh

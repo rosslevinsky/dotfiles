@@ -1,0 +1,9 @@
+# The GitHub accounts this machine is meant to have, one per line. git-identity-check expects
+# a key for each. An account the owners file declares but this file omits must be refused a
+# login here. A file holding only comments counts as missing.
+#
+# To fill in: remove `#> ` from the suggested line below and change alice to your account.
+#
+# To check: run `~/.local/bin/git-identity-check`.
+#
+#> alice

@@ -1,0 +1,10 @@
+# Codex settings shared across machines. setup.sh merges these top-level keys into
+# ~/.codex/config.toml and leaves every other line there alone.
+#
+# Only deliberate preferences belong here. The rest of that file stays machine-local:
+# Codex writes per-directory trust_level entries into it as you work, and command
+# approvals are per-project. The model is a personal choice, so it isn't set here either.
+#
+# Only simple `key = value` lines, one per line: that is all the merge understands. The merge
+# sets keys and never removes one, so a key taken out of this file keeps its last value on a
+# machine that already has it.

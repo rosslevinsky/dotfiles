@@ -1,0 +1,43 @@
+# The routing: every GitHub URL for an owner goes to its SSH alias, and every repo of that
+# owner uses its identity file. A repo with no routed remote refuses to commit.
+#
+# To fill in: remove `#> ` from the suggested lines below and change alice to your account.
+# Copy the two owner blocks for each further `owner` line in the owners file.
+#
+# To check: run `setup.sh --git-identity`, then `~/.local/bin/git-identity-check`.
+#
+#> [user]
+#>     # Never fall back to a made-up address: refuse to commit instead.
+#>     useConfigOnly = true
+#> [init]
+#>     defaultBranch = main
+#>
+# Shared by every identity, so no identity file can leave signing switched off.
+#> [gpg]
+#>     format = ssh
+#> [gpg "ssh"]
+#>     allowedSignersFile = ~/.config/git/allowed_signers
+#> [commit]
+#>     gpgsign = true
+#> [tag]
+#>     gpgsign = true
+#>
+# One owner's URLs go to its SSH alias.
+#> [url "git@github-alice:alice/"]
+#>     insteadOf = git@github.com:alice/
+#>     insteadOf = https://github.com/alice/
+#>     insteadOf = ssh://git@github.com/alice/
+#>
+# One owner's repos use its identity file.
+#> [includeIf "hasconfig:remote.*.url:git@github.com:alice/**"]
+#>     path = ~/.config/git/identity-alice
+#> [includeIf "hasconfig:remote.*.url:https://github.com/alice/**"]
+#>     path = ~/.config/git/identity-alice
+#> [includeIf "hasconfig:remote.*.url:ssh://git@github.com/alice/**"]
+#>     path = ~/.config/git/identity-alice
+#> [includeIf "hasconfig:remote.*.url:git@github-alice:alice/**"]
+#>     path = ~/.config/git/identity-alice
+#>
+# Machine-local overrides. Git ignores a missing include. Last, so it can override the rest.
+#> [include]
+#>     path = ~/.config/git/local
