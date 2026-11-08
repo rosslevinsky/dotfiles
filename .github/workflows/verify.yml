@@ -1,5 +1,8 @@
 name: Verify
 
+# A pull request is tested as a pull request, and main on each push. A push to main that merges a
+# pull request is usually not tested again: see `tested`. In the public repo, releases arrive as
+# pushes to main with no pull request behind them, so each release gets the full run.
 on:
   pull_request:
   push:
@@ -10,7 +13,79 @@ on:
 # stopped meaning anything. Nothing surfaces them until someone goes looking, so they
 # run on every push rather than only when someone remembers.
 jobs:
+  # Has this exact tree of files already passed? A push to main is usually a merge, and the pull
+  # request behind it tested the same files minutes earlier: the commit is new, the tree is not.
+  #
+  # The claim needs three things: a candidate commit with the same tree, a successful run of this
+  # workflow at it, and that run's own record (the receipt `verify` uploads) that it checked out
+  # this tree. A pull request run tests the merge of head and base, not the head, so a green run
+  # at the head proves this tree only if its receipt names it.
+  #
+  # The candidates are a merge commit's second parent and the head of the pull request this
+  # commit closed, which covers merge and squash merges. Anything that fails to answer counts as
+  # "not proved", and the tests run.
+  tested:
+    # A pull request's merge tree can equal its head while the head is exactly what hasn't been
+    # tested, so the question is only asked on a push.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # A job's block replaces the workflow's. Still read-only: these let it read a commit's tree
+    # and a run's result.
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      already: ${{ steps.proved.outputs.already }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Look for a green run of this tree
+        id: proved
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW: verify.yml
+          RECEIPT: tested-tree
+        run: |
+          tree=$(git rev-parse "HEAD^{tree}")
+          echo "this tree: $tree"
+          second=$(git rev-parse --verify --quiet "HEAD^2" || true)
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+                   --jq '.[].head.sha' 2>/dev/null || true)
+          for candidate in $second $head; do
+            candidate_tree=$(gh api "repos/$GITHUB_REPOSITORY/commits/$candidate" \
+                               --jq '.commit.tree.sha' 2>/dev/null) || continue
+            if [ "$candidate_tree" != "$tree" ]; then
+              echo "$candidate: different tree ($candidate_tree)"
+              continue
+            fi
+            run=$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW/runs?head_sha=$candidate&status=success&per_page=1" \
+              --jq '.workflow_runs[0].id // empty' 2>/dev/null) || continue
+            if [ -z "$run" ]; then
+              echo "$candidate: same tree, no green run of $WORKFLOW"
+              continue
+            fi
+            if gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts" \
+                 --jq '.artifacts[].name' 2>/dev/null | grep -qxF "$RECEIPT-$tree"; then
+              echo "already=true" >> "$GITHUB_OUTPUT"
+              echo "$candidate: run $run checked out this exact tree and was green" \
+                | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "$candidate: green run $run carries no $RECEIPT-$tree receipt"
+          done
+          echo "already=false" >> "$GITHUB_OUTPUT"
+          echo "no commit with this tree has a green run; the tests run" | tee -a "$GITHUB_STEP_SUMMARY"
+
   verify:
+    # `always()` lets a pull request through, where `tested` is skipped; without it a skipped
+    # dependency skips this job too.
+    needs: tested
+    if: always() && needs.tested.outputs.already != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -18,6 +93,22 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      # The receipt `tested` reads: the tree this run checked out. It counts only if the run
+      # succeeds, since `tested` asks only about successful runs.
+      - name: Record the tree this run checked out
+        id: receipt
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          t=$(git rev-parse "HEAD^{tree}")
+          echo "$t" > "$RUNNER_TEMP/tested-tree.txt"
+          echo "name=tested-tree-$t" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: steps.receipt.outputs.name != ''
+        with:
+          name: ${{ steps.receipt.outputs.name }}
+          path: ${{ runner.temp }}/tested-tree.txt
+          retention-days: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -72,8 +163,8 @@ jobs:
           fi
           bash tests/test_line_budget.sh
 
-  # One version, checked against the checksum its project publishes, so a new gitleaks can't
-  # change this result or reach the runner unnoticed.
+  # Runs on every event. One version, checked against the checksum its project publishes, so a
+  # new gitleaks can't change this result or reach the runner unnoticed.
   gitleaks:
     runs-on: ubuntu-latest
     env:
@@ -100,6 +191,8 @@ jobs:
   # newer git, so the identity suites also run here, on the distro's packages. The image
   # ships without python3, which git-identity-check needs.
   identity-git-2-43:
+    needs: tested
+    if: always() && needs.tested.outputs.already != 'true'
     runs-on: ubuntu-latest
     container: ubuntu:24.04
     steps:

@@ -11,6 +11,10 @@ MIT licensed. See `LICENSE`.
 holds only releases. A pull request can't be merged as it stands. An issue or a patch is welcome:
 the change is made by hand and arrives in a later release, not under its own commit.
 
+**Releases are versioned** by the month they ship in, `vYEAR.MONTH.N`, with N counting from 0
+within the month. Each is tagged and listed on the repo's Releases page. `CHANGELOG.md` says
+what each one changed.
+
 ---
 
 ## How it fits together
